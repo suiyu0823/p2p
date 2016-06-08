@@ -1,0 +1,306 @@
+/* index_server.c - main */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <time.h>
+#include <fcntl.h>
+#include "data_structs.h"
+
+
+/*------------------------------------------------------------------------
+ * main - Iterative UDP index server for peer to peer service
+ *------------------------------------------------------------------------
+ */
+time_t  now;
+
+
+database *files;
+static int files_ind = 0;
+
+/*===============================================================================
+    display_pdu(): print out the data of a PDU frame to console.
+=================================================================================*/
+void display_pdu(frame *x)
+{
+    printf("files_ind = %d\n", files_ind);
+    fprintf(stderr,"PDU TYPE:   %c\n", x->type);
+    fprintf(stderr,"Peer Name:  %s\n", x->peer);
+    fprintf(stderr,"Content Name:   %s\n", x->content);
+    fprintf(stderr,"Address:    %s\n", x->address);
+    fprintf(stderr,"port:       %s\n", x->port);
+}
+
+/*===============================================================================
+    debug(): print out the database information to console.
+=================================================================================*/
+void debug(int i)
+{
+    int j;
+    printf("******************************* file[%d]: %s\n", i, files[i].file_name);
+    printf("********** file[%d].ref_ptr = %d\n", i, files[i].ref_ptr);
+    for(j =0; j < files[i].ref_ptr ; j++) {
+        printf(">>>>> peer[%d] = %s\n", j, files[i].file_ref[j].peer);
+        printf(">>>>> peer[%d].address = %s\n", j, files[i].file_ref[j].address);
+        printf(">>>>> peer[%d].port = %s\n", j, files[i].file_ref[j].port);
+    }
+    printf("******************************* Debug End\n");
+}
+
+/*===============================================================================
+    content_register(): update the content database as per peer upload.
+=================================================================================*/
+int content_register(frame *fin, frame *fout)
+{
+    int i,j;
+    char new_file=1;
+    
+    for (i=0; i<files_ind; i++) 
+    {   //check if the file is brand new;
+        if (!strcmp(files[i].file_name, fin->content)) { new_file = 0; break; }
+    }
+    
+    if (new_file) {
+        //create new file database;
+        strcpy(files[files_ind].file_name, fin->content);
+        files[files_ind].file_ref = (frame*)malloc(MAX * sizeof(frame));
+        files[files_ind].ref_ptr = 1;
+        files[files_ind].file_ref[0] = *fin;
+        files_ind++;
+        
+    } else {
+        //update the existing file database;
+        for (j=0; j < files[i].ref_ptr; j++) {
+            //return error if the peer has already registered the file before;
+            if (!strcmp(files[i].file_ref[j].peer, fin->peer)) { fout->type = 'E'; return NO;}
+        }
+        files[i].file_ref[files[i].ref_ptr] = *fin;
+        files[i].ref_ptr++;
+        
+    }
+
+    fout->type = 'A';
+    return YES;
+}
+
+/*===============================================================================
+    content_download(): search and provide file available download address.
+=================================================================================*/
+int content_download(frame *fin, frame *fout)
+{
+    int i;
+    char new_file = 1;
+    for (i=0; i<files_ind; i++) 
+    {
+
+        if (!strcmp(files[i].file_name, fin->content)) { new_file = 0; break; }
+    }
+    if (new_file || files[i].ref_ptr < 1) {
+        fout->type = 'E';
+        return NO;
+    }
+    
+    *fout = files[i].file_ref[files[i].ref_ptr-1];
+    fout->type = 'S';
+
+    return YES;
+}
+
+/*===============================================================================
+    content_deregister(): de-register a file and update the database.
+=================================================================================*/
+int content_deregister(frame *fin, frame *fout)
+{
+    int i,j;
+    char new_file=1;
+    // Search and Locate the file;
+    for (i=0; i<files_ind; i++) 
+    {
+        if (!strcmp(files[i].file_name, fin->content)) { 
+            new_file = 0; 
+            break; 
+        }
+    }
+    if (new_file) { fout->type = 'E'; return NO;} //Error: Cannot find the file;
+    
+    // Search and Locate the peer that has the file;
+    for (j=0; j < files[i].ref_ptr; j++) {
+    
+        if (!strcmp(files[i].file_ref[j].peer, fin->peer)) {
+            //remove the peer from the file reference list;
+            int temp;
+            for (temp = j; temp < files[i].ref_ptr-1; temp++) {
+                
+                strcpy(files[i].file_ref[temp].peer, files[i].file_ref[temp+1].peer);
+                strcpy(files[i].file_ref[temp].address, files[i].file_ref[temp+1].address);
+                strcpy(files[i].file_ref[temp].port, files[i].file_ref[temp+1].port);
+
+            }
+            files[i].ref_ptr--;
+            fout->type = 'A';
+            return YES;
+        }
+    }
+    // return error if the peer has not even registered the file before.
+    fout->type = 'E';
+    return NO;
+}
+
+/*===============================================================================
+    content_list(): list all the available files to peer.
+=================================================================================*/
+int content_list(int sdes, struct sockaddr_in skin)
+{
+    int i;
+    struct pdu tbuf;
+    
+    memset(&tbuf, '\0', 101);
+    
+    tbuf.type = 'O';
+    for (i = 0; i < files_ind; i++)
+    {
+        debug(i);
+	if (files[i].ref_ptr > 0) {
+            strcpy(tbuf.content, files[i].file_name);
+            (void) sendto(sdes, &tbuf, 101, 0, (struct sockaddr *)&skin,sizeof(skin));
+        }
+    }
+    tbuf.type = 'E';
+    (void) sendto(sdes, &tbuf, 101, 0, (struct sockaddr *)&skin,sizeof(skin));
+    return YES;
+}
+
+
+/*===============================================================================
+    MAIN PROGRAM
+=================================================================================*/
+int main(int argc, char *argv[])
+{
+    struct sockaddr_in fsin;    /* the from address of a client */
+    char    *service = "3000";  /* service name or port number  */
+    char    *pts;
+    int sock,n,m;           /* server socket        */
+    int alen;           /* from-address length      */
+    struct sockaddr_in sin; /* an Internet endpoint address         */
+    int     s, type;        /* socket descriptor and socket type    */
+    u_short portbase = 0;   /* port base, for non-root servers  */
+    FILE *log_file;
+                                                                                
+    struct pdu t_pdu;
+    struct pdu r_pdu;
+
+    int file;
+    int i; 
+
+    switch (argc) {
+    case    1:
+        break;
+    case    2:
+        service = argv[1];
+        break;
+    default:
+        fprintf(stderr, "usage: index_server UDP[host [port]]\n");
+
+    }
+
+    /*****************************************************
+                Create UDP socket for index server
+    ******************************************************/
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = INADDR_ANY;
+
+    /* Map service name to port number */
+    sin.sin_port = htons((u_short)atoi(service));
+                                                                  
+    /* Allocate a socket */
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0){
+        fprintf(stderr, "can't creat socket\n");
+        exit(1);
+    }                                                                           
+    /* Bind the socket */
+    if (bind(s, (struct sockaddr *)&sin, sizeof(sin)) < 0)
+        fprintf(stderr, "can't bind to %s port\n", service);
+    
+    alen = sizeof(fsin);
+    
+    files = (database*)malloc(MAX * sizeof(database));
+    
+    /*****************************************************
+                    Main program start here
+    ******************************************************/
+    fprintf(stderr,"*********************************\n");
+    fprintf(stderr,"*******    Index Server   *******\n");
+    fprintf(stderr,"*********************************\n");
+    while(1) {
+
+        //alen = sizeof(fsin);
+        if ( (n=recvfrom(s, &r_pdu, 101, 0, (struct sockaddr *)&fsin,&alen)) < 0)
+            fprintf(stderr,"recvfrom error\n");
+            
+        //display_pdu(&r_pdu);
+        (void) time(&now);
+        pts = ctime(&now);
+        printf("%s",pts);
+        
+        //display_pdu(&r_pdu);
+        memset(&t_pdu, 0, 101); //clear transmitted buffer.
+        
+        switch (r_pdu.type) {
+            case 'R':
+                /* File Registration or Upload */
+                if (content_register(&r_pdu, &t_pdu)){
+                    printf("\t%s\tUpload\t",r_pdu.address);
+                    printf("\t\"%s\"\n",r_pdu.content);
+                } else {
+                    fprintf(stderr,"\tUpload Error!\n");
+                }
+                (void) sendto(s, &t_pdu, 101, 0, (struct sockaddr *)&fsin,sizeof(fsin));
+                break;
+                
+            case 'S':
+                /* File Search or Download */
+                if (content_download(&r_pdu, &t_pdu)){
+                    printf("\t%s\tDownload\t",r_pdu.address);
+                    printf("\t\"%s\"\n",r_pdu.content);
+                } else {
+                    fprintf(stderr,"\tDownload Error!\n");
+                }
+                (void) sendto(s, &t_pdu, 101, 0, (struct sockaddr *)&fsin,sizeof(fsin));
+                break;
+                
+            case 'O':
+                /* File Listing */
+                printf("\tListing\n");
+                content_list(s, fsin);
+                break;
+                
+            case 'T':
+                /* File De-Registration */
+                if (content_deregister(&r_pdu, &t_pdu)){
+                    printf("\t%s\tDe-register\t",r_pdu.address);
+                    printf("\t\"%s\"\n",r_pdu.content);
+                } else {
+                    fprintf(stderr,"\tNo such file!\n");
+                }
+                (void) sendto(s, &t_pdu, 101, 0, (struct sockaddr *)&fsin,sizeof(fsin));
+                break;
+                
+            default:
+                /* Unsupported PDU type return Error */
+                fprintf(stderr,"\tError: invalid PDU type\n");
+                t_pdu.type = 'E';
+                strcpy(t_pdu.peer, "Error PDU type!!!\n");
+                break;
+        }
+    }// Main loop
+    exit(0);
+}
+
+
+
